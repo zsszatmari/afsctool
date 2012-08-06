@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -12,7 +13,9 @@
 #include <hfs/hfs_format.h>
 #include <unistd.h>
 #include <zlib.h>
+#include <sys/mman.h>
 
+#include <CoreFoundation/CoreFoundation.h>
 #include <CoreServices/CoreServices.h>
 
 const char *sizeunit10_short[] = {"KB", "MB", "GB", "TB", "PB", "EB"};
@@ -41,8 +44,33 @@ struct folder_info
 	double minSavings;
 	bool print_files;
 	bool compress_files;
+	bool allowLargeBlocks;
 	bool check_files;
 	bool check_hard_links;
+	struct filetype_info *filetypes;
+	long long int numfiletypes;
+	long long int filetypessize;
+	char **filetypeslist;
+	int filetypeslistlen;
+	int filetypeslistsize;
+	bool invert_filetypelist;
+};
+
+struct filetype_info
+{
+	char *filetype;
+	char **extensions;
+	int extensionssize;
+	int numextensions;
+	long long int uncompressed_size;
+	long long int uncompressed_size_rounded;
+	long long int compressed_size;
+	long long int compressed_size_rounded;
+	long long int compattr_size;
+	long long int total_size;
+	long long int num_compressed;
+	long long int num_files;
+	long long int num_hard_link_files;
 };
 
 char* getSizeStr(long long int size, long long int size_rounded)
@@ -84,17 +112,55 @@ char* getSizeStr(long long int size, long long int size_rounded)
 	return sizeStr;
 }
 
-void compressFile(const char *inFile, struct stat *inFileInfo, long long int maxSize, int compressionlevel, double minSavings, bool checkFiles)
+#define POLYNOMIAL 0x04c11db7L
+
+static unsigned long crc_table[256];
+
+/* generate the table of CRC remainders for all possible bytes */
+static void GenerateCRCTable()
 {
-	FILE *in;
+    register int i, j;  
+    register unsigned long crc_accum;
+    for (i = 0;  i < 256;  i++)
+    {
+        crc_accum = ((unsigned long) i << 24);
+        for (j = 0;  j < 8;  j++)
+        {
+            if (crc_accum & 0x80000000L)
+                crc_accum = (crc_accum << 1) ^ POLYNOMIAL;
+            else
+                crc_accum = (crc_accum << 1);
+        }
+        crc_table[i] = crc_accum;
+    }
+}
+
+/* update the CRC on the data block one byte at a time */
+static unsigned long UpdateCRC(unsigned long crc_accum, const char *data_blk_ptr, int data_blk_size)
+{
+    register int i, j;
+    for (j = 0;  j < data_blk_size;  j++)
+    {
+        i = ((int) (crc_accum >> 24) ^ *data_blk_ptr++) & 0xff;
+        crc_accum = (crc_accum << 8) ^ crc_table[i];
+    }
+    return crc_accum;
+}
+
+void compressFile(const char *inFile, struct stat *inFileInfo, long long int maxSize, int compressionlevel, bool allowLargeBlocks, double minSavings, bool checkFiles)
+{
+    GenerateCRCTable();
+    
+    int in;
 	struct statfs fsInfo;
 	unsigned int compblksize = 0x10000, numBlocks, outdecmpfsSize = 0;
-	void *inBuf, *outBuf, *outBufBlock, *outdecmpfsBuf, *currBlock, *blockStart;
+	void *inMapped, *inBackup, *outBufBlock, *outdecmpfsBuf;
+    int blockStart, currBlock;
 	long long int inBufPos, filesize = inFileInfo->st_size;
 	unsigned long int cmpedsize;
 	char *xattrnames, *curr_attr;
 	ssize_t xattrnamesize;
-	UInt32 cmpf = 0x636D7066;
+	UInt32 cmpf = 'cmpf';
 	struct timeval times[2];
 	
 	times[0].tv_sec = inFileInfo->st_atimespec.tv_sec;
@@ -151,82 +217,117 @@ void compressFile(const char *inFile, struct stat *inFileInfo, long long int max
 	if ((filesize + 0x13A + (numBlocks * 9)) > 2147483647)
 		return;
 	
-	in = fopen(inFile, "r+");
-	if (in == NULL)
-	{
-		fprintf(stderr, "%s: %s\n", inFile, strerror(errno));
+    
+    in = open(inFile, O_RDONLY);
+    if (in < 0) {
+        fprintf(stderr, "%s: %s\n", inFile, strerror(errno));
 		return;
-	}
-	inBuf = malloc(filesize);
-	if (inBuf == NULL)
+    }
+    inMapped = mmap(NULL, filesize, PROT_READ, MAP_FILE | MAP_NOCACHE | MAP_SHARED, in, 0);
+	if (inMapped == MAP_FAILED)
 	{
-		fprintf(stderr, "%s: malloc error, unable to allocate input buffer\n", inFile);
-		fclose(in);
+		fprintf(stderr, "%s: mmap error, unable to map input buffer: %s\n", inFile, strerror(errno));
+		close(in);
 		utimes(inFile, times);
 		return;
 	}
-	if (fread(inBuf, filesize, 1, in) != 1)
-	{
-		fprintf(stderr, "%s: Error reading file\n", inFile);
-		fclose(in);
+    inBackup = mmap(NULL, filesize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_NOCACHE | MAP_SHARED, 0, 0);
+    if (inBackup == MAP_FAILED) {
+        fprintf(stderr, "%s: mmap error, unable to map temp buffer: %s\n", inFile, strerror(errno));
+		close(in);
+        munmap(inMapped, filesize);
 		utimes(inFile, times);
-		free(inBuf);
-		return;
-	}
-	fclose(in);
-	outBuf = malloc(filesize + 0x13A + (numBlocks * 9));
-	if (outBuf == NULL)
-	{
-		fprintf(stderr, "%s: malloc error, unable to allocate output buffer\n", inFile);
-		utimes(inFile, times);
-		free(inBuf);
 		return;
 	}
 	outdecmpfsBuf = malloc(3802);
 	if (outdecmpfsBuf == NULL)
 	{
 		fprintf(stderr, "%s: malloc error, unable to allocate xattr buffer\n", inFile);
+        munmap(inMapped, filesize);
+        munmap(inBackup, filesize);
+        close(in);
 		utimes(inFile, times);
-		free(inBuf);
-		free(outBuf);
 		return;
 	}
 	outBufBlock = malloc(compressBound(compblksize));
 	if (outBufBlock == NULL)
 	{
 		fprintf(stderr, "%s: malloc error, unable to allocate compression buffer\n", inFile);
-		utimes(inFile, times);
-		free(inBuf);
-		free(outBuf);
+        munmap(inMapped, filesize);
+        munmap(inBackup, filesize);
+        close(in);
 		free(outdecmpfsBuf);
+		utimes(inFile, times);
 		return;
 	}
 	*(UInt32 *) outdecmpfsBuf = EndianU32_NtoL(cmpf);
 	*(UInt32 *) (outdecmpfsBuf + 4) = EndianU32_NtoL(4);
 	*(UInt64 *) (outdecmpfsBuf + 8) = EndianU64_NtoL(filesize);
 	outdecmpfsSize = 0x10;
-	*(UInt32 *) outBuf = EndianU32_NtoB(0x100);
-	*(UInt32 *) (outBuf + 12) = EndianU32_NtoB(0x32);
-	memset(outBuf + 16, 0, 0xF0);
-	blockStart = outBuf + 0x104;
-	*(UInt32 *) blockStart = EndianU32_NtoL(numBlocks);
+    
+    UInt32 value = EndianU32_NtoB(0x100);;
+    int failed = 0;
+    if (setxattr(inFile, "com.apple.ResourceFork", &value, sizeof(value), 0, XATTR_NOFOLLOW | XATTR_CREATE) < 0) {
+        failed = 1;
+    }
+    value = EndianU32_NtoB(0x32);
+    if (!failed && setxattr(inFile, "com.apple.ResourceFork", &value, sizeof(value), 12, XATTR_NOFOLLOW) < 0) {
+        failed = 1;
+    }
+    char zeros[0xF0];
+    if (!failed && setxattr(inFile, "com.apple.ResourceFork", zeros, sizeof(zeros), 16, XATTR_NOFOLLOW) < 0) {
+        failed = 1;
+    }
+	blockStart = 0x104;
+    value = EndianU32_NtoL(numBlocks);
+    if (!failed && setxattr(inFile, "com.apple.ResourceFork", &value, sizeof(value), blockStart, XATTR_NOFOLLOW) < 0) {
+        failed = 1;
+    }
+    if (failed) {
+        fprintf(stderr, "%s: setxattr: %s\n", inFile, strerror(errno));
+        free(outdecmpfsBuf);
+        free(outBufBlock);		
+        utimes(inFile, times);
+        munmap(inMapped, filesize);
+        munmap(inBackup, filesize);
+        close(in);
+		return;
+    }
+    
+    unsigned long crcOriginal = 0xFFFFFFFF;
 	currBlock = blockStart + 0x4 + (numBlocks * 8);
 	for (inBufPos = 0; inBufPos < filesize; inBufPos += compblksize, currBlock += cmpedsize)
 	{
 		cmpedsize = compressBound(compblksize);
-		if (compress2(outBufBlock, &cmpedsize, inBuf + inBufPos, ((filesize - inBufPos) > compblksize) ? compblksize : filesize - inBufPos, compressionlevel) != Z_OK)
+        int sizeToCompress = ((filesize - inBufPos) > compblksize) ? compblksize : filesize - inBufPos;
+        crcOriginal = UpdateCRC(crcOriginal, inMapped + inBufPos, sizeToCompress);
+        memcpy(inBackup + inBufPos, inMapped + inBufPos, sizeToCompress);
+		if (compress2(outBufBlock, &cmpedsize, inMapped + inBufPos, sizeToCompress, compressionlevel) != Z_OK)
 		{
-			utimes(inFile, times);
-			free(inBuf);
-			free(outBuf);
+            munmap(inMapped, filesize);
+            munmap(inBackup, filesize);
+            close(in);
 			free(outdecmpfsBuf);
 			free(outBufBlock);
+			utimes(inFile, times);
 			return;
 		}
 		if (cmpedsize > (((filesize - inBufPos) > compblksize) ? compblksize : filesize - inBufPos))
 		{
+			if (!allowLargeBlocks && (((filesize - inBufPos) > compblksize) ? compblksize : filesize - inBufPos) == compblksize)
+            {
+                munmap(inMapped, filesize);
+                munmap(inBackup, filesize);
+                close(in);
+                free(outdecmpfsBuf);
+                free(outBufBlock);
+                
+                // free up space
+                removexattr(inFile, "com.apple.ResourceFork", XATTR_NOFOLLOW | XATTR_SHOWCOMPRESSION);
+				return;
+            }
 			*(unsigned char *) outBufBlock = 0xFF;
-			memcpy(outBufBlock + 1, inBuf + inBufPos, ((filesize - inBufPos) > compblksize) ? compblksize : filesize - inBufPos);
+			memcpy(outBufBlock + 1, inMapped + inBufPos, ((filesize - inBufPos) > compblksize) ? compblksize : filesize - inBufPos);
 			cmpedsize = ((filesize - inBufPos) > compblksize) ? compblksize : filesize - inBufPos;
 			cmpedsize++;
 		}
@@ -237,60 +338,106 @@ void compressFile(const char *inFile, struct stat *inFileInfo, long long int max
 			outdecmpfsSize += cmpedsize;
 			break;
 		}
-		memcpy(currBlock, outBufBlock, cmpedsize);
-		*(UInt32 *) (blockStart + ((inBufPos / compblksize) * 8) + 0x4) = EndianU32_NtoL(currBlock - blockStart);
-		*(UInt32 *) (blockStart + ((inBufPos / compblksize) * 8) + 0x8) = EndianU32_NtoL(cmpedsize);
+        
+        if (!failed && setxattr(inFile, "com.apple.ResourceFork", outBufBlock, cmpedsize, currBlock, XATTR_NOFOLLOW) < 0) {
+            failed = 1;
+        }
+        value = EndianU32_NtoL(currBlock - blockStart);
+        if (!failed && setxattr(inFile, "com.apple.ResourceFork", &value, sizeof(value), blockStart + ((inBufPos / compblksize) * 8) + 0x4, XATTR_NOFOLLOW) < 0) {
+            failed = 1;
+        }
+        value = EndianU32_NtoL(cmpedsize);
+        if (!failed && setxattr(inFile, "com.apple.ResourceFork", &value, sizeof(value), blockStart + ((inBufPos / compblksize) * 8) + 0x8, XATTR_NOFOLLOW) < 0) {
+            failed = 1;
+        }
+        
+        if (failed) {
+            munmap(inMapped, filesize);
+            munmap(inBackup, filesize);
+            close(in);
+            free(outdecmpfsBuf);
+            free(outBufBlock);
+            return;
+        }
 	}
+    munmap(inMapped, filesize);
+    close(in);
 	
 	if (EndianU32_LtoN(*(UInt32 *) (outdecmpfsBuf + 4)) == 4)
 	{
-		if ((((double) (currBlock - outBuf + 50) / filesize) >= (1.0 - minSavings / 100) && minSavings != 0.0) ||
-			currBlock - outBuf + 50 >= filesize)
+		if ((((double) (currBlock + outdecmpfsSize + 50) / filesize) >= (1.0 - minSavings / 100) && minSavings != 0.0) ||
+			currBlock + outdecmpfsSize + 50 >= filesize)
 		{
 			utimes(inFile, times);
-			free(inBuf);
-			free(outBuf);
 			free(outdecmpfsBuf);
 			free(outBufBlock);
 			return;
 		}
-		*(UInt32 *) (outBuf + 4) = EndianU32_NtoB(currBlock - outBuf);
-		*(UInt32 *) (outBuf + 8) = EndianU32_NtoB(currBlock - outBuf - 0x100);
-		*(UInt32 *) (blockStart - 4) = EndianU32_NtoB(currBlock - outBuf - 0x104);
-		memset(currBlock, 0, 24);
-		*(UInt16 *) (currBlock + 24) = EndianU16_NtoB(0x1C);
-		*(UInt16 *) (currBlock + 26) = EndianU16_NtoB(0x32);
-		*(UInt16 *) (currBlock + 28) = 0;
-		*(UInt32 *) (currBlock + 30) = EndianU32_NtoB(cmpf);
-		*(UInt32 *) (currBlock + 34) = EndianU32_NtoB(0xA);
-		*(UInt64 *) (currBlock + 38) = EndianU64_NtoL(0xFFFF0100);
-		*(UInt32 *) (currBlock + 46) = 0;
-		if (setxattr(inFile, "com.apple.ResourceFork", outBuf, currBlock - outBuf + 50, 0, XATTR_NOFOLLOW | XATTR_CREATE) < 0)
+        value = EndianU32_NtoL(currBlock);
+        if (!failed && setxattr(inFile, "com.apple.ResourceFork", &value, sizeof(value), 4, XATTR_NOFOLLOW) < 0) {
+            failed = 1;
+        }
+        value = EndianU32_NtoL(currBlock - 0x100);
+        if (!failed && setxattr(inFile, "com.apple.ResourceFork", &value, sizeof(value), 8, XATTR_NOFOLLOW) < 0) {
+            failed = 1;
+        }
+        value = EndianU32_NtoB(currBlock - 0x104);
+        if (!failed && setxattr(inFile, "com.apple.ResourceFork", &value, sizeof(value), blockStart - 4, XATTR_NOFOLLOW) < 0) {
+            failed = 1;
+        }
+        UInt16 value16 = EndianU16_NtoB(0x1C);
+        if (!failed && setxattr(inFile, "com.apple.ResourceFork", &value16, sizeof(value16), currBlock + 24, XATTR_NOFOLLOW) < 0) {
+            failed = 1;
+        }
+        value16 = EndianU16_NtoB(0x32);
+        if (!failed && setxattr(inFile, "com.apple.ResourceFork", &value16, sizeof(value16), currBlock + 26, XATTR_NOFOLLOW) < 0) {
+            failed = 1;
+        }
+        value16 = 0;
+        if (!failed && setxattr(inFile, "com.apple.ResourceFork", &value16, sizeof(value16), currBlock + 28, XATTR_NOFOLLOW) < 0) {
+            failed = 1;
+        }
+        value = EndianU32_NtoB(cmpf);
+        if (!failed && setxattr(inFile, "com.apple.ResourceFork", &value, sizeof(value), currBlock + 30, XATTR_NOFOLLOW) < 0) {
+            failed = 1;
+        }
+        value = EndianU32_NtoB(0xA);
+        if (!failed && setxattr(inFile, "com.apple.ResourceFork", &value, sizeof(value), currBlock + 34, XATTR_NOFOLLOW) < 0) {
+            failed = 1;
+        }
+        UInt64 value64 = EndianU64_NtoL(0xFFFF0100);
+        if (!failed && setxattr(inFile, "com.apple.ResourceFork", &value64, sizeof(value64), currBlock + 38, XATTR_NOFOLLOW) < 0) {
+            failed = 1;
+        }
+        value = 0;
+        if (!failed && setxattr(inFile, "com.apple.ResourceFork", &value, sizeof(value), currBlock + 46, XATTR_NOFOLLOW) < 0) {
+            failed = 1;
+        }
+        
+		if (failed)
 		{
 			fprintf(stderr, "%s: setxattr: %s\n", inFile, strerror(errno));
-			free(inBuf);
-			free(outBuf);
+            munmap(inBackup, filesize);
 			free(outdecmpfsBuf);
 			free(outBufBlock);
 			return;
 		}
 	}
+    
 	if (setxattr(inFile, "com.apple.decmpfs", outdecmpfsBuf, outdecmpfsSize, 0, XATTR_NOFOLLOW | XATTR_CREATE) < 0)
 	{
 		fprintf(stderr, "%s: setxattr: %s\n", inFile, strerror(errno));
-		free(inBuf);
-		free(outBuf);
 		free(outdecmpfsBuf);
 		free(outBufBlock);
 		return;
 	}
-	in = fopen(inFile, "w");
-	if (in == NULL)
+    FILE *inToWrite = fopen(inFile, "w");
+	if (inToWrite == NULL)
 	{
 		fprintf(stderr, "%s: %s\n", inFile, strerror(errno));
 		return;
 	}
-	fclose(in);
+	fclose(inToWrite);
 	if (chflags(inFile, UF_COMPRESSED | inFileInfo->st_flags) < 0)
 	{
 		fprintf(stderr, "%s: chflags: %s\n", inFile, strerror(errno));
@@ -303,48 +450,54 @@ void compressFile(const char *inFile, struct stat *inFileInfo, long long int max
 		{
 			fprintf(stderr, "%s: removexattr: %s\n", inFile, strerror(errno));
 		}
-		in = fopen(inFile, "w");
-		if (in == NULL)
+		inToWrite = fopen(inFile, "w");
+		if (inToWrite == NULL)
 		{
-			free(inBuf);
-			free(outBuf);
+            munmap(inBackup, filesize);
+			free(inToWrite);
 			free(outdecmpfsBuf);
 			free(outBufBlock);
 			fprintf(stderr, "%s: %s\n", inFile, strerror(errno));
 			return;
 		}
-		if (fwrite(inBuf, filesize, 1, in) != 1)
+		if (fwrite(inBackup, filesize, 1, inToWrite) != 1)
 		{
-			free(inBuf);
-			free(outBuf);
+            munmap(inBackup, filesize);
 			free(outdecmpfsBuf);
 			free(outBufBlock);
 			fprintf(stderr, "%s: Error writing to file\n", inFile);
 			return;
 		}
-		fclose(in);
+		fclose(inToWrite);
 		utimes(inFile, times);
 		return;
 	}
 	if (checkFiles)
 	{
 		lstat(inFile, inFileInfo);
-		in = fopen(inFile, "r");
-		if (in == NULL)
+		inToWrite = fopen(inFile, "r");
+		if (inToWrite == NULL)
 		{
 			fprintf(stderr, "%s: %s\n", inFile, strerror(errno));
 			return;
 		}
+        unsigned long crcAfter = 0xFFFFFFFF;
+        char checkBuf[4096];
+        int readBytes;
+        while ((readBytes = fread(checkBuf, 1, sizeof(checkBuf), inToWrite)) > 0) {
+            crcAfter = UpdateCRC(crcAfter, checkBuf, readBytes);
+        }
+        fclose(inToWrite);
+        
 		if (inFileInfo->st_size != filesize || 
-			fread(outBuf, filesize, 1, in) != 1 ||
-			memcmp(outBuf, inBuf, filesize) != 0)
+			crcOriginal != crcAfter)
 		{
-			fclose(in);
 			printf("%s: Compressed file check failed, reverting file changes\n", inFile);
+            // TODO: resurrection needed!
+
 			if (chflags(inFile, (~UF_COMPRESSED) & inFileInfo->st_flags) < 0)
 			{
-				free(inBuf);
-				free(outBuf);
+				munmap(inBackup, filesize);
 				free(outdecmpfsBuf);
 				free(outBufBlock);
 				fprintf(stderr, "%s: chflags: %s\n", inFile, strerror(errno));
@@ -359,31 +512,29 @@ void compressFile(const char *inFile, struct stat *inFileInfo, long long int max
 			{
 				fprintf(stderr, "%s: removexattr: %s\n", inFile, strerror(errno));
 			}
-			in = fopen(inFile, "w");
-			if (in == NULL)
+			inToWrite = fopen(inFile, "w");
+			if (inToWrite == NULL)
 			{
-				free(inBuf);
-				free(outBuf);
+                munmap(inBackup, filesize);
 				free(outdecmpfsBuf);
 				free(outBufBlock);
 				fprintf(stderr, "%s: %s\n", inFile, strerror(errno));
 				return;
 			}
-			if (fwrite(inBuf, filesize, 1, in) != 1)
+			if (fwrite(inBackup, filesize, 1, inToWrite) != 1)
 			{
-				free(inBuf);
-				free(outBuf);
+				munmap(inBackup, filesize);
 				free(outdecmpfsBuf);
 				free(outBufBlock);
+                fclose(inToWrite);
 				fprintf(stderr, "%s: Error writing to file\n", inFile);
 				return;
 			}
+            fclose(inToWrite);
 		}
-		fclose(in);
 	}
 	utimes(inFile, times);
-	free(inBuf);
-	free(outBuf);
+    munmap(inBackup, filesize);
 	free(outdecmpfsBuf);
 	free(outBufBlock);
 }
@@ -775,6 +926,8 @@ void decompressFile(const char *inFile, struct stat *inFileInfo)
 	in = fopen(inFile, "r+");
 	if (in == NULL)
 	{
+		if (chflags(inFile, UF_COMPRESSED & inFileInfo->st_flags) < 0)
+			fprintf(stderr, "%s: chflags: %s\n", inFile, strerror(errno));
 		fprintf(stderr, "%s: %s\n", inFile, strerror(errno));
 		if (inBuf != NULL)
 			free(inBuf);
@@ -838,13 +991,13 @@ bool checkForHardLink(const char *filepath, const struct stat *fileInfo, const s
 			if (hardLinks == NULL)
 			{
 				fprintf(stderr, "Malloc error allocating memory for list of file hard links, exiting...\n");
-				exit(-1);
+				exit(ENOMEM);
 			}
 			paths = (char **) malloc(currSize * sizeof(char *));
 			if (paths == NULL)
 			{
 				fprintf(stderr, "Malloc error allocating memory for list of file hard links, exiting...\n");
-				exit(-1);
+				exit(ENOMEM);
 			}
 		}
 		
@@ -878,17 +1031,17 @@ bool checkForHardLink(const char *filepath, const struct stat *fileInfo, const s
 		if (currSize < numLinks + 1)
 		{
 			currSize *= 2;
-			hardLinks = realloc(hardLinks, currSize * sizeof(ino_t));
+			hardLinks = (ino_t *) realloc(hardLinks, currSize * sizeof(ino_t));
 			if (hardLinks == NULL)
 			{
 				fprintf(stderr, "Malloc error allocating memory for list of file hard links, exiting...\n");
-				exit(-1);
+				exit(ENOMEM);
 			}
-			paths = realloc(paths, currSize * sizeof(char *));
+			paths = (char **) realloc(paths, currSize * sizeof(char *));
 			if (paths == NULL)
 			{
 				fprintf(stderr, "Malloc error allocating memory for list of file hard links, exiting...\n");
-				exit(-1);
+				exit(ENOMEM);
 			}
 		}
 		if ((numLinks != 0) && ((numLinks - 1) >= left_pos))
@@ -919,9 +1072,172 @@ bool checkForHardLink(const char *filepath, const struct stat *fileInfo, const s
 	return FALSE;
 }
 
+void add_extension_to_filetypeinfo(const char *filepath, struct filetype_info *filetypeinfo)
+{
+	long int right_pos, left_pos = 0, curr_pos = 1, i, fileextensionlen;
+	const char *fileextension;
+	
+	for (i = strlen(filepath) - 1; i > 0; i--)
+		if (filepath[i] == '.' || filepath[i] == '/')
+			break;
+	if (i != 0 && i != strlen(filepath) - 1 && filepath[i] != '/' && filepath[i-1] != '/')
+		fileextension = &filepath[i+1];
+	else
+		return;
+	
+	if (filetypeinfo->extensions == NULL)
+	{
+		filetypeinfo->extensionssize = 1;
+		filetypeinfo->extensions = (char **) malloc(filetypeinfo->extensionssize * sizeof(char *));
+		if (filetypeinfo->extensions == NULL)
+		{
+			fprintf(stderr, "Malloc error allocating memory for list of file types, exiting...\n");
+			exit(ENOMEM);
+		}
+	}
+	
+	if (filetypeinfo->numextensions > 0)
+	{
+		left_pos = 0;
+		right_pos = filetypeinfo->numextensions + 1;
+		
+		while (strcasecmp(filetypeinfo->extensions[curr_pos-1], fileextension) != 0)
+		{
+			curr_pos = (right_pos - left_pos) / 2;
+			if (curr_pos == 0) break;
+			curr_pos += left_pos;
+			if (strcasecmp(filetypeinfo->extensions[curr_pos-1], fileextension) > 0)
+				right_pos = curr_pos;
+			else if (strcasecmp(filetypeinfo->extensions[curr_pos-1], fileextension) < 0)
+				left_pos = curr_pos;
+		}
+		if (curr_pos != 0 && strcasecmp(filetypeinfo->extensions[curr_pos-1], fileextension) == 0)
+			return;
+	}
+	if (filetypeinfo->extensionssize < filetypeinfo->numextensions + 1)
+	{
+		filetypeinfo->extensionssize *= 2;
+		filetypeinfo->extensions = (char **) realloc(filetypeinfo->extensions, filetypeinfo->extensionssize * sizeof(char *));
+		if (filetypeinfo->extensions == NULL)
+		{
+			fprintf(stderr, "Malloc error allocating memory for list of file types, exiting...\n");
+			exit(ENOMEM);
+		}
+	}
+	if ((filetypeinfo->numextensions != 0) && ((filetypeinfo->numextensions - 1) >= left_pos))
+		memmove(&filetypeinfo->extensions[left_pos+1], &filetypeinfo->extensions[left_pos], (filetypeinfo->numextensions - left_pos) * sizeof(char *));
+	filetypeinfo->extensions[left_pos] = (char *) malloc(strlen(fileextension) + 1);
+	strcpy(filetypeinfo->extensions[left_pos], fileextension);
+	for (fileextensionlen = strlen(fileextension), i = 0; i < fileextensionlen; i++)
+		filetypeinfo->extensions[left_pos][i] = tolower(filetypeinfo->extensions[left_pos][i]);
+	filetypeinfo->numextensions++;
+}
+
+char* getFileType(const char *filepath)
+{
+	CFStringRef filepathCF = CFStringCreateWithCString(kCFAllocatorDefault, filepath, kCFStringEncodingUTF8);
+	CFStringRef filetype;
+	MDItemRef fileMDItem;
+	char *filetypeMaxLenStr, *filetypeStr;
+	UInt32 filetypeMaxLen;
+	
+	fileMDItem = MDItemCreate(kCFAllocatorDefault, filepathCF);
+	CFRelease(filepathCF);
+	if (fileMDItem == NULL)
+		return NULL;
+	filetype = (CFStringRef) MDItemCopyAttribute(fileMDItem, kMDItemContentType);
+	CFRelease(fileMDItem);
+	if (filetype == NULL)
+		return NULL;
+	filetypeMaxLen = CFStringGetMaximumSizeForEncoding(CFStringGetLength(filetype), kCFStringEncodingUTF8) + 1;
+	filetypeMaxLenStr = (char *) malloc(filetypeMaxLen);
+	if (!CFStringGetCString(filetype, filetypeMaxLenStr, filetypeMaxLen, kCFStringEncodingUTF8))
+	{
+		CFRelease(filetype);
+		return NULL;
+	}
+	CFRelease(filetype);
+	filetypeStr = (char *) malloc(strlen(filetypeMaxLenStr) + 1);
+	if (filetypeStr == NULL) return NULL;
+	strcpy(filetypeStr, filetypeMaxLenStr);
+	free(filetypeMaxLenStr);
+	
+	return filetypeStr;
+}
+
+struct filetype_info* getFileTypeInfo(const char *filepath, const char *filetype, struct folder_info *folderinfo)
+{
+	long int right_pos, left_pos = 0, curr_pos = 1;
+	
+	if (filetype == NULL)
+		return NULL;
+	
+	if (folderinfo->filetypes == NULL)
+	{
+		folderinfo->filetypessize = 1;
+		folderinfo->filetypes = (struct filetype_info *) malloc(folderinfo->filetypessize * sizeof(struct filetype_info));
+		if (folderinfo->filetypes == NULL)
+		{
+			fprintf(stderr, "Malloc error allocating memory for list of file types, exiting...\n");
+			exit(ENOMEM);
+		}
+	}
+	
+	if (folderinfo->numfiletypes > 0)
+	{
+		left_pos = 0;
+		right_pos = folderinfo->numfiletypes + 1;
+		
+		while (strcmp(folderinfo->filetypes[curr_pos-1].filetype, filetype) != 0)
+		{
+			curr_pos = (right_pos - left_pos) / 2;
+			if (curr_pos == 0) break;
+			curr_pos += left_pos;
+			if (strcmp(folderinfo->filetypes[curr_pos-1].filetype, filetype) > 0)
+				right_pos = curr_pos;
+			else if (strcmp(folderinfo->filetypes[curr_pos-1].filetype, filetype) < 0)
+				left_pos = curr_pos;
+		}
+		if (curr_pos != 0 && strcmp(folderinfo->filetypes[curr_pos-1].filetype, filetype) == 0)
+		{
+			add_extension_to_filetypeinfo(filepath, &folderinfo->filetypes[curr_pos-1]);
+			return &folderinfo->filetypes[curr_pos-1];
+		}
+	}
+	if (folderinfo->filetypessize < folderinfo->numfiletypes + 1)
+	{
+		folderinfo->filetypessize *= 2;
+		folderinfo->filetypes = (struct filetype_info *) realloc(folderinfo->filetypes, folderinfo->filetypessize * sizeof(struct filetype_info));
+		if (folderinfo->filetypes == NULL)
+		{
+			fprintf(stderr, "Malloc error allocating memory for list of file types, exiting...\n");
+			exit(ENOMEM);
+		}
+	}
+	if ((folderinfo->numfiletypes != 0) && ((folderinfo->numfiletypes - 1) >= left_pos))
+		memmove(&folderinfo->filetypes[left_pos+1], &folderinfo->filetypes[left_pos], (folderinfo->numfiletypes - left_pos) * sizeof(struct filetype_info));
+	folderinfo->filetypes[left_pos].filetype = (char *) malloc(strlen(filetype) + 1);
+	strcpy(folderinfo->filetypes[left_pos].filetype, filetype);
+	folderinfo->filetypes[left_pos].extensions = NULL;
+	folderinfo->filetypes[left_pos].extensionssize = 0;
+	folderinfo->filetypes[left_pos].numextensions = 0;
+	folderinfo->filetypes[left_pos].uncompressed_size = 0;
+	folderinfo->filetypes[left_pos].uncompressed_size_rounded = 0;
+	folderinfo->filetypes[left_pos].compressed_size = 0;
+	folderinfo->filetypes[left_pos].compressed_size_rounded = 0;
+	folderinfo->filetypes[left_pos].compattr_size = 0;
+	folderinfo->filetypes[left_pos].total_size = 0;
+	folderinfo->filetypes[left_pos].num_compressed = 0;
+	folderinfo->filetypes[left_pos].num_files = 0;
+	folderinfo->filetypes[left_pos].num_hard_link_files = 0;
+	add_extension_to_filetypeinfo(filepath, &folderinfo->filetypes[left_pos]);
+	folderinfo->numfiletypes++;
+	return &folderinfo->filetypes[left_pos];
+}
+
 void printFileInfo(const char *filepath, struct stat *fileinfo, bool appliedcomp)
 {
-	char *xattrnames, *curr_attr;
+	char *xattrnames, *curr_attr, *filetype;
 	ssize_t xattrnamesize, xattrssize = 0, xattrsize, RFsize = 0, compattrsize = 0;
 	long long int filesize, filesize_rounded;
 	int numxattrs = 0, numhiddenattr = 0;
@@ -978,6 +1294,11 @@ void printFileInfo(const char *filepath, struct stat *fileinfo, bool appliedcomp
 			printf("Unable to compress file.\n");
 		else
 			printf("File is not HFS+ compressed.\n");
+		if ((filetype = getFileType(filepath)) != NULL)
+		{
+			printf("File content type: %s\n", filetype);
+			free(filetype);
+		}
 		if (hasRF)
 		{
 			printf("File data fork size: %lld bytes\n", fileinfo->st_size);
@@ -997,18 +1318,23 @@ void printFileInfo(const char *filepath, struct stat *fileinfo, bool appliedcomp
 		}
 		printf("Number of extended attributes: %d\n", numxattrs - numhiddenattr);
 		printf("Total size of extended attribute data: %ld bytes\n", xattrssize);
-		printf("Appoximate overhead of extended attributes: %ld bytes\n", ((ssize_t) numxattrs) * sizeof(HFSPlusAttrKey));
+		printf("Approximate overhead of extended attributes: %ld bytes\n", ((ssize_t) numxattrs) * sizeof(HFSPlusAttrKey));
 		filesize = fileinfo->st_size;
 		filesize += (filesize % fileinfo->st_blksize) ? fileinfo->st_blksize - (filesize % fileinfo->st_blksize) : 0;
 		filesize += RFsize;
 		filesize += (filesize % fileinfo->st_blksize) ? fileinfo->st_blksize - (filesize % fileinfo->st_blksize) : 0;
 		filesize += compattrsize + xattrssize + (((ssize_t) numxattrs) * sizeof(HFSPlusAttrKey)) + sizeof(HFSPlusCatalogFile);
-		printf("Appoximate total file size (data fork + resource fork + EA + EA overhead + file overhead): %s\n", getSizeStr(filesize, filesize));
+		printf("Approximate total file size (data fork + resource fork + EA + EA overhead + file overhead): %s\n", getSizeStr(filesize, filesize));
 	}
 	else
 	{
 		if (!appliedcomp)
 			printf("File is HFS+ compressed.\n");
+		if ((filetype = getFileType(filepath)) != NULL)
+		{
+			printf("File content type: %s\n", filetype);
+			free(filetype);
+		}
 		filesize = fileinfo->st_size;
 		printf("File size (uncompressed data fork; reported size by Mac OS 10.6+ Finder): %s\n", getSizeStr(filesize, filesize));
 		filesize_rounded = filesize = RFsize;
@@ -1022,21 +1348,23 @@ void printFileInfo(const char *filepath, struct stat *fileinfo, bool appliedcomp
 		printf("Compression savings: %0.1f%%\n", (1.0 - (((double) RFsize + compattrsize) / fileinfo->st_size)) * 100.0);
 		printf("Number of extended attributes: %d\n", numxattrs - numhiddenattr);
 		printf("Total size of extended attribute data: %ld bytes\n", xattrssize);
-		printf("Appoximate overhead of extended attributes: %ld bytes\n", ((ssize_t) numxattrs) * sizeof(HFSPlusAttrKey));
+		printf("Approximate overhead of extended attributes: %ld bytes\n", ((ssize_t) numxattrs) * sizeof(HFSPlusAttrKey));
 		filesize = RFsize;
 		filesize += (filesize % fileinfo->st_blksize) ? fileinfo->st_blksize - (filesize % fileinfo->st_blksize) : 0;
 		filesize += compattrsize + xattrssize + (((ssize_t) numxattrs) * sizeof(HFSPlusAttrKey)) + sizeof(HFSPlusCatalogFile);
-		printf("Appoximate total file size (compressed data fork + EA + EA overhead + file overhead): %s\n", getSizeStr(filesize, filesize));
+		printf("Approximate total file size (compressed data fork + EA + EA overhead + file overhead): %s\n", getSizeStr(filesize, filesize));
 	}
 }
 
-void process_file(const char *filepath, struct stat *fileinfo, struct folder_info *folderinfo)
+void process_file(const char *filepath, const char *filetype, struct stat *fileinfo, struct folder_info *folderinfo)
 {
 	char *xattrnames, *curr_attr;
+	const char *fileextension = NULL;
 	ssize_t xattrnamesize, xattrssize = 0, xattrsize, RFsize = 0, compattrsize = 0;
 	long long int filesize, filesize_rounded;
-	int numxattrs = 0, numhiddenattr = 0;
-	bool hasRF = FALSE;
+	int numxattrs = 0, numhiddenattr = 0, i;
+	struct filetype_info *filetypeinfo = NULL;
+	bool filetype_found = FALSE;
 	
 	xattrnamesize = listxattr(filepath, NULL, 0, XATTR_SHOWCOMPRESSION | XATTR_NOFOLLOW);
 	
@@ -1067,7 +1395,6 @@ void process_file(const char *filepath, struct stat *fileinfo, struct folder_inf
 			if (strcmp(curr_attr, "com.apple.ResourceFork") == 0 && strlen(curr_attr) == 22)
 			{
 				RFsize += xattrsize;
-				hasRF = TRUE;
 				numhiddenattr++;
 			}
 			else if (strcmp(curr_attr, "com.apple.decmpfs") == 0 && strlen(curr_attr) == 17)
@@ -1082,6 +1409,24 @@ void process_file(const char *filepath, struct stat *fileinfo, struct folder_inf
 	}
 	
 	folderinfo->num_files++;
+	
+	if (folderinfo->filetypeslist != NULL && filetype != NULL)
+	{
+		for (i = strlen(filepath) - 1; i > 0; i--)
+			if (filepath[i] == '.' || filepath[i] == '/')
+				break;
+		if (i != 0 && i != strlen(filepath) - 1 && filepath[i] != '/' && filepath[i-1] != '/')
+			fileextension = &filepath[i+1];
+		for (i = 0; i < folderinfo->filetypeslistlen; i++)
+			if (strcmp(folderinfo->filetypeslist[i], filetype) == 0 ||
+				strcmp("ALL", folderinfo->filetypeslist[i]) == 0 ||
+				(fileextension != NULL && strcasecmp(fileextension, folderinfo->filetypeslist[i]) == 0))
+				filetype_found = TRUE;
+	}
+	if (folderinfo->filetypeslist != NULL && filetype_found)
+		filetypeinfo = getFileTypeInfo(filepath, filetype, folderinfo);
+	if (filetype_found && filetypeinfo != NULL) filetypeinfo->num_files++;
+	
 	if ((fileinfo->st_flags & UF_COMPRESSED) == 0)
 	{
 		filesize_rounded = filesize = fileinfo->st_size;
@@ -1093,12 +1438,21 @@ void process_file(const char *filepath, struct stat *fileinfo, struct folder_inf
 		folderinfo->uncompressed_size_rounded += filesize_rounded;
 		folderinfo->compressed_size += filesize;
 		folderinfo->compressed_size_rounded += filesize_rounded;
+		if (filetypeinfo != NULL && filetype_found)
+		{
+			filetypeinfo->uncompressed_size += filesize;
+			filetypeinfo->uncompressed_size_rounded += filesize_rounded;
+			filetypeinfo->compressed_size += filesize;
+			filetypeinfo->compressed_size_rounded += filesize_rounded;
+		}
 		filesize = fileinfo->st_size;
 		filesize += (filesize % fileinfo->st_blksize) ? fileinfo->st_blksize - (filesize % fileinfo->st_blksize) : 0;
 		filesize += RFsize;
 		filesize += (filesize % fileinfo->st_blksize) ? fileinfo->st_blksize - (filesize % fileinfo->st_blksize) : 0;
 		filesize += compattrsize + xattrssize + (((ssize_t) numxattrs) * sizeof(HFSPlusAttrKey)) + sizeof(HFSPlusCatalogFile);
 		folderinfo->total_size += filesize;
+		if (filetypeinfo != NULL && filetype_found)
+			filetypeinfo->total_size += filesize;
 	}
 	else
 	{
@@ -1107,6 +1461,8 @@ void process_file(const char *filepath, struct stat *fileinfo, struct folder_inf
 			if (folderinfo->print_info > 1)
 			{
 				printf("%s:\n", filepath);
+				if (filetype != NULL)
+					printf("File content type: %s\n", filetype);
 				filesize = fileinfo->st_size;
 				printf("File size (uncompressed data fork; reported size by Mac OS 10.6+ Finder): %s\n", getSizeStr(filesize, filesize));
 				filesize_rounded = filesize = RFsize;
@@ -1120,11 +1476,11 @@ void process_file(const char *filepath, struct stat *fileinfo, struct folder_inf
 				printf("Compression savings: %0.1f%%\n", (1.0 - (((double) RFsize + compattrsize) / fileinfo->st_size)) * 100.0);
 				printf("Number of extended attributes: %d\n", numxattrs - numhiddenattr);
 				printf("Total size of extended attribute data: %ld bytes\n", xattrssize);
-				printf("Appoximate overhead of extended attributes: %ld bytes\n", ((ssize_t) numxattrs) * sizeof(HFSPlusAttrKey));
+				printf("Approximate overhead of extended attributes: %ld bytes\n", ((ssize_t) numxattrs) * sizeof(HFSPlusAttrKey));
 				filesize = RFsize;
 				filesize += (filesize % fileinfo->st_blksize) ? fileinfo->st_blksize - (filesize % fileinfo->st_blksize) : 0;
 				filesize += compattrsize + xattrssize + (((ssize_t) numxattrs) * sizeof(HFSPlusAttrKey)) + sizeof(HFSPlusCatalogFile);
-				printf("Appoximate total file size (compressed data fork + EA + EA overhead + file overhead): %s\n", getSizeStr(filesize, filesize));
+				printf("Approximate total file size (compressed data fork + EA + EA overhead + file overhead): %s\n", getSizeStr(filesize, filesize));
 			}
 			else if (!folderinfo->compress_files)
 			{
@@ -1136,26 +1492,43 @@ void process_file(const char *filepath, struct stat *fileinfo, struct folder_inf
 		filesize_rounded += (filesize_rounded % fileinfo->st_blksize) ? fileinfo->st_blksize - (filesize_rounded % fileinfo->st_blksize) : 0;
 		folderinfo->uncompressed_size += filesize;
 		folderinfo->uncompressed_size_rounded += filesize_rounded;
+		if (filetypeinfo != NULL && filetype_found)
+		{
+			filetypeinfo->uncompressed_size += filesize;
+			filetypeinfo->uncompressed_size_rounded += filesize_rounded;
+		}
 		filesize_rounded = filesize = RFsize;
 		filesize_rounded += (filesize_rounded % fileinfo->st_blksize) ? fileinfo->st_blksize - (filesize_rounded % fileinfo->st_blksize) : 0;
 		folderinfo->compressed_size += filesize;
 		folderinfo->compressed_size_rounded += filesize_rounded;
 		folderinfo->compattr_size += compattrsize;
+		if (filetypeinfo != NULL && filetype_found)
+		{
+			filetypeinfo->compressed_size += filesize;
+			filetypeinfo->compressed_size_rounded += filesize_rounded;
+			filetypeinfo->compattr_size += compattrsize;
+		}
 		filesize = RFsize;
 		filesize += (filesize % fileinfo->st_blksize) ? fileinfo->st_blksize - (filesize % fileinfo->st_blksize) : 0;
 		filesize += compattrsize + xattrssize + (((ssize_t) numxattrs) * sizeof(HFSPlusAttrKey)) + sizeof(HFSPlusCatalogFile);
 		folderinfo->total_size += filesize;
 		folderinfo->num_compressed++;
+		if (filetypeinfo != NULL && filetype_found)
+		{
+			filetypeinfo->total_size += filesize;
+			filetypeinfo->num_compressed++;
+		}
 	}
 }
 
 void process_folder(FTS *currfolder, struct folder_info *folderinfo)
 {
 	FTSENT *currfile;
-	char *xattrnames, *curr_attr;
+	char *xattrnames, *curr_attr, *filetype = NULL, *fileextension;
 	ssize_t xattrnamesize, xattrssize, xattrsize;
-	int numxattrs;
-	bool volume_search;
+	int numxattrs, i;
+	bool volume_search, filetype_found;
+	struct filetype_info *filetypeinfo = NULL;
 	
 	currfile = fts_read(currfolder);
 	if (currfile == NULL)
@@ -1224,11 +1597,44 @@ void process_folder(FTS *currfolder, struct folder_info *folderinfo)
 			}
 			else if (S_ISREG(currfile->fts_statp->st_mode) || S_ISLNK(currfile->fts_statp->st_mode))
 			{
+				filetype_found = FALSE;
+				if (folderinfo->filetypeslist != NULL)
+				{
+					filetype = getFileType(currfile->fts_path);
+					if (filetype == NULL)
+					{
+						filetype = (char *) malloc(10);
+						strcpy(filetype, "UNDEFINED");
+					}
+				}
+				if (filetype != NULL)
+				{
+					fileextension = NULL;
+					for (i = strlen(currfile->fts_path) - 1; i > 0; i--)
+						if (currfile->fts_path[i] == '.')
+							break;
+					if (i != 0 && i != strlen(currfile->fts_path) - 1 && currfile->fts_path[i] != '/' && currfile->fts_path[i-1] != '/')
+						fileextension = &currfile->fts_path[i+1];
+					for (i = 0; i < folderinfo->filetypeslistlen; i++)
+						if (strcmp(folderinfo->filetypeslist[i], filetype) == 0 ||
+							strcmp("ALL", folderinfo->filetypeslist[i]) == 0 ||
+							(fileextension != NULL && strcasecmp(fileextension, folderinfo->filetypeslist[i]) == 0))
+							filetype_found = TRUE;
+					if (folderinfo->invert_filetypelist)
+					{
+						if (filetype_found)
+							filetype_found = FALSE;
+						else
+							filetype_found = TRUE;
+					}
+				}
+				
 				if (!folderinfo->check_hard_links || !checkForHardLink(currfile->fts_path, currfile->fts_statp, folderinfo))
 				{
 					if (folderinfo->compress_files && S_ISREG(currfile->fts_statp->st_mode))
 					{
-						compressFile(currfile->fts_path, currfile->fts_statp, folderinfo->maxSize, folderinfo->compressionlevel, folderinfo->minSavings, folderinfo->check_files);
+						if (folderinfo->filetypeslist == NULL || filetype_found)
+							compressFile(currfile->fts_path, currfile->fts_statp, folderinfo->maxSize, folderinfo->compressionlevel, folderinfo->allowLargeBlocks, folderinfo->minSavings, folderinfo->check_files);
 						lstat(currfile->fts_path, currfile->fts_statp);
 						if (((currfile->fts_statp->st_flags & UF_COMPRESSED) == 0) && folderinfo->print_files)
 						{
@@ -1237,7 +1643,7 @@ void process_folder(FTS *currfolder, struct folder_info *folderinfo)
 							printf("%s\n", currfile->fts_path);
 						}
 					}
-					process_file(currfile->fts_path, currfile->fts_statp, folderinfo);
+					process_file(currfile->fts_path, filetype, currfile->fts_statp, folderinfo);
 				}
 				else
 				{
@@ -1245,7 +1651,15 @@ void process_folder(FTS *currfolder, struct folder_info *folderinfo)
 					
 					folderinfo->num_files++;
 					folderinfo->total_size += sizeof(HFSPlusCatalogFile);
+					if (filetype_found && (filetypeinfo = getFileTypeInfo(currfile->fts_path, filetype, folderinfo)) != NULL)
+					{
+						filetypeinfo->num_hard_link_files++;
+						
+						filetypeinfo->num_files++;
+						filetypeinfo->total_size += sizeof(HFSPlusCatalogFile);
+					}
 				}
+				if (filetype != NULL) free(filetype);
 			}
 		}
 		else
@@ -1257,33 +1671,59 @@ void process_folder(FTS *currfolder, struct folder_info *folderinfo)
 
 void printUsage()
 {
-	printf("afsctool 1.2.3 (build 23)\n"
+	printf("afsctool 1.6.4 (build 34)\n"
 		   "Report if file is HFS+ compressed:                        afsctool [-v] file\n"
-		   "Report if folder contains HFS+ compressed files:          afsctool [-fvv] folder\n"
+		   "Report if folder contains HFS+ compressed files:          afsctool [-fvvi] [-t <ContentType/Extension>] folder\n"
 		   "List HFS+ compressed files in folder:                     afsctool -l[fvv] folder\n"
-		   "Decompress HFS+ compressed file or folder:                afsctool -d file/folder\n"
+		   "Decompress HFS+ compressed file or folder:                afsctool -d[i] [-t <ContentType>] file/folder\n"
 		   "Create archive file with compressed data in data fork:    afsctool -a[d] src dst\n"
 		   "Extract HFS+ compression archive to file:                 afsctool -x[d] src dst\n"
-		   "Apply HFS+ compression to file or folder:                 afsctool -c[klfvv] [compressionlevel [maxFileSize [minPercentSavings]]] file/folder\n\n"
+		   "Apply HFS+ compression to file or folder:                 afsctool -c[nlfvvi] [-<level>] [-m <size>] [-s <percentage>] [-t <ContentType>] file/folder\n\n"
 		   "Options:\n"
 		   "-v Increase verbosity level\n"
-		   "-f Skip files if a hard link to them has already been processeed\n"
+		   "-f Detect hard links\n"
 		   "-l List files that are HFS+ compressed (or if the -c option is given, files which fail to compress)\n"
-		   "-k Verify file after compression, and revert file changes if file verification fails\n");
+		   "-L Allow large compressed blocks (not recommended)\n"
+		   "-n Do not verify files after compression (not recommended)\n"
+		   "-m <size> Largest file size to compress, in bytes\n"
+		   "-s <percentage> For compression to be applied, compression savings must be at least this percentage\n"
+		   "-t <ContentType/Extension> Return statistics for files of given content type and when compressing,\n"
+		   "                           if this option is given then only files of content type(s) or extension(s) specified with this option will be compressed\n"
+		   "-i Compress or show statistics for files that don't have content type(s) or extension(s) given by -t <ContentType/Extension> instead of those that do\n"
+		   "-<level> Compression level to use when compressing (ranging from 1 to 9, with 1 being the fastest and 9 being the best - default is 5)\n");
 }
+/*
+void compressFileDefault(const char *fullPath)
+{
+    struct stat fileinfo;
+    if (lstat(fullPath, &fileinfo) < 0)
+	{
+		fprintf(stderr, "%s: %s\n", fullPath, strerror(errno));
+		return;
+	}
+    int maxSize = 0;
+    int compressionLevel = 5;
+    bool allowLargeBlocks = FALSE;
+    double minSavings = 0.0f;
+    bool fileCheck = TRUE;
+    
+    compressFile(fullPath, &fileinfo, maxSize, compressionLevel, allowLargeBlocks, minSavings, fileCheck);
+}*/
+
 
 int main (int argc, const char * argv[])
 {
 	int i, j;
 	struct stat fileinfo, dstfileinfo;
 	struct folder_info folderinfo;
+	struct filetype_info alltypesinfo;
 	FTS *currfolder;
 	FTSENT *currfile;
-	char *folderarray[2], *fullpath = NULL, *fullpathdst = NULL, *cwd;
+	char *folderarray[2], *fullpath = NULL, *fullpathdst = NULL, *cwd, *fileextension, *filetype = NULL;
 	int printVerbose = 0, compressionlevel = 5;
-	double minSavings = 25.0;
-	long long int foldersize, foldersize_rounded, maxSize = 20971520;
-	bool printDir = FALSE, decomp = FALSE, createfile = FALSE, extractfile = FALSE, applycomp = FALSE, fileCheck = FALSE, argIsFile, hardLinkCheck = FALSE, dstIsFile, free_src = FALSE, free_dst = FALSE;
+	double minSavings = 0.0;
+	long long int foldersize, foldersize_rounded, filesize, filesize_rounded, maxSize = 0;
+	bool printDir = FALSE, decomp = FALSE, createfile = FALSE, extractfile = FALSE, applycomp = FALSE, fileCheck = TRUE, argIsFile, hardLinkCheck = FALSE, dstIsFile, free_src = FALSE, free_dst = FALSE, invert_filetypelist = FALSE, allowLargeBlocks = FALSE, filetype_found;
 	FILE *afscFile, *outFile;
 	char *xattrnames, *curr_attr, header[4];
 	ssize_t xattrnamesize, xattrsize, getxattrret, xattrPos;
@@ -1292,10 +1732,14 @@ int main (int argc, const char * argv[])
 	UInt16 big16;
 	UInt64 big64;
 	
+	folderinfo.filetypeslist = NULL;
+	folderinfo.filetypeslistlen = 0;
+	folderinfo.filetypeslistsize = 0;
+	
 	if (argc < 2)
 	{
 		printUsage();
-		exit(EINVAL);
+		return EINVAL;
 	}
 	
 	for (i = 1; i < argc && argv[i][0] == '-'; i++)
@@ -1311,6 +1755,14 @@ int main (int argc, const char * argv[])
 						exit(EINVAL);
 					}
 					printDir = TRUE;
+					break;
+				case 'L':
+					if (createfile || extractfile || decomp)
+					{
+						printUsage();
+						exit(EINVAL);
+					}
+					allowLargeBlocks = TRUE;
 					break;
 				case 'v':
 					printVerbose++;
@@ -1348,12 +1800,15 @@ int main (int argc, const char * argv[])
 					applycomp = TRUE;
 					break;
 				case 'k':
+					// this flag is obsolete and no longer does anything, but it is kept here for backward compatibility with scripts that use it
+					break;
+				case 'n':
 					if (createfile || extractfile || decomp)
 					{
 						printUsage();
 						exit(EINVAL);
 					}
-					fileCheck = TRUE;
+					fileCheck = FALSE;
 					break;
 				case 'f':
 					if (createfile || extractfile || decomp)
@@ -1363,40 +1818,86 @@ int main (int argc, const char * argv[])
 					}
 					hardLinkCheck = TRUE;
 					break;
+				case '1':
+				case '2':
+				case '3':
+				case '4':
+				case '5':
+				case '6':
+				case '7':
+				case '8':
+				case '9':
+					if (createfile || extractfile || decomp)
+					{
+						printUsage();
+						exit(EINVAL);
+					}
+					compressionlevel = argv[i][j] - '0';
+					break;
+				case 'm':
+					if (createfile || extractfile || decomp || j + 1 < strlen(argv[i]) || i + 2 > argc)
+					{
+						printUsage();
+						exit(EINVAL);
+					}
+					i++;
+					sscanf(argv[i], "%lld", &maxSize);
+					j = strlen(argv[i]) - 1;
+					break;
+				case 's':
+					if (createfile || extractfile || decomp || j + 1 < strlen(argv[i]) || i + 2 > argc)
+					{
+						printUsage();
+						exit(EINVAL);
+					}
+					i++;
+					sscanf(argv[i], "%lf", &minSavings);
+					if (minSavings > 99 || minSavings < 0)
+					{
+						fprintf(stderr, "Invalid minimum savings percentage; must be a number from 0 to 99\n");
+						exit(EINVAL);
+					}
+					j = strlen(argv[i]) - 1;
+					break;
+				case 't':
+					if (j + 1 < strlen(argv[i]) || i + 2 > argc)
+					{
+						printUsage();
+						exit(EINVAL);
+					}
+					i++;
+					if (folderinfo.filetypeslist == NULL)
+					{
+						folderinfo.filetypeslistsize = 1;
+						folderinfo.filetypeslist = (char **) malloc(folderinfo.filetypeslistlen * sizeof(char *));
+					}
+					if (folderinfo.filetypeslistlen + 1 > folderinfo.filetypeslistsize)
+					{
+						folderinfo.filetypeslistsize *= 2;
+						folderinfo.filetypeslist = (char **) realloc(folderinfo.filetypeslist, folderinfo.filetypeslistsize * sizeof(char *));
+					}
+					if (folderinfo.filetypeslist == NULL)
+					{
+						fprintf(stderr, "malloc error, out of memory\n");
+						return ENOMEM;
+					}
+					folderinfo.filetypeslist[folderinfo.filetypeslistlen++] = (char *) argv[i];
+					j = strlen(argv[i]) - 1;
+					break;
+				case 'i':
+					if (createfile || extractfile)
+					{
+						printUsage();
+						exit(EINVAL);
+					}
+					invert_filetypelist = TRUE;
+					break;
 				default:
 					printUsage();
 					exit(EINVAL);
 					break;
 			}
 		}
-	}
-	
-	if (applycomp && (argc - i > 1))
-	{
-		sscanf(argv[i], "%d", &compressionlevel);
-		if (compressionlevel > 9 || compressionlevel < 1)
-		{
-			fprintf(stderr, "Invalid compression level; must be a number from 1 to 9\n");
-			return -1;
-		}
-		i++;
-	}
-	
-	if (applycomp && (argc - i > 1))
-	{
-		sscanf(argv[i], "%lld", &maxSize);
-		i++;
-	}
-	
-	if (applycomp && (argc - i > 1))
-	{
-		sscanf(argv[i], "%lf", &minSavings);
-		if (minSavings > 99 || minSavings < 0)
-		{
-			fprintf(stderr, "Invalid minimum savings percentage; must be a number from 0 to 99\n");
-			return -1;
-		}
-		i++;
 	}
 	
 	if (i == argc || ((createfile || extractfile) && (argc - i < 2)))
@@ -1462,7 +1963,7 @@ int main (int argc, const char * argv[])
 	
 	if (applycomp && argIsFile)
 	{
-		compressFile(fullpath, &fileinfo, maxSize, compressionlevel, minSavings, fileCheck);
+		compressFile(fullpath, &fileinfo, maxSize, compressionlevel, allowLargeBlocks, minSavings, fileCheck);
 		lstat(fullpath, &fileinfo);
 	}
 	
@@ -1674,8 +2175,42 @@ int main (int argc, const char * argv[])
 			exit(EACCES);
 		}
 		while ((currfile = fts_read(currfolder)) != NULL)
-			if ((currfile->fts_statp->st_mode & S_IFDIR) == 0)
+		{
+			filetype_found = FALSE;
+			if (folderinfo.filetypeslist != NULL)
+			{
+				filetype = getFileType(currfile->fts_path);
+				if (filetype == NULL)
+				{
+					filetype = (char *) malloc(10);
+					strcpy(filetype, "UNDEFINED");
+				}
+			}
+			if (filetype != NULL)
+			{
+				fileextension = NULL;
+				for (i = strlen(currfile->fts_path) - 1; i > 0; i--)
+					if (currfile->fts_path[i] == '.')
+						break;
+				if (i != 0 && i != strlen(currfile->fts_path) - 1 && currfile->fts_path[i] != '/' && currfile->fts_path[i-1] != '/')
+					fileextension = &currfile->fts_path[i+1];
+				for (i = 0; i < folderinfo.filetypeslistlen; i++)
+					if (strcmp(folderinfo.filetypeslist[i], filetype) == 0 ||
+						strcmp("ALL", folderinfo.filetypeslist[i]) == 0 ||
+						(fileextension != NULL && strcasecmp(fileextension, folderinfo.filetypeslist[i]) == 0))
+						filetype_found = TRUE;
+				if (invert_filetypelist)
+				{
+					if (filetype_found)
+						filetype_found = FALSE;
+					else
+						filetype_found = TRUE;
+				}
+			}
+			if ((currfile->fts_statp->st_mode & S_IFDIR) == 0 && (folderinfo.filetypeslist == NULL || filetype_found))
 				decompressFile(currfile->fts_path, currfile->fts_statp);
+			if (filetype != NULL) free(filetype);
+		}
 		fts_close(currfolder);
 	}
 	else if (argIsFile && printVerbose == 0)
@@ -1719,16 +2254,133 @@ int main (int argc, const char * argv[])
 		folderinfo.print_files = printDir;
 		folderinfo.compress_files = applycomp;
 		folderinfo.check_files = fileCheck;
+		folderinfo.allowLargeBlocks = allowLargeBlocks;
 		folderinfo.compressionlevel = compressionlevel;
 		folderinfo.minSavings = minSavings;
 		folderinfo.maxSize = maxSize;
 		folderinfo.check_hard_links = hardLinkCheck;
+		folderinfo.filetypes = NULL;
+		folderinfo.numfiletypes = 0;
+		folderinfo.filetypessize = 0;
+		folderinfo.invert_filetypelist = invert_filetypelist;
 		process_folder(currfolder, &folderinfo);
 		folderinfo.num_folders--;
 		if (printVerbose > 0 || !printDir)
 		{
 			if (printDir) printf("\n");
 			printf("%s:\n", fullpath);
+			if (folderinfo.filetypes != NULL)
+			{
+				alltypesinfo.filetype = NULL;
+				alltypesinfo.uncompressed_size = 0;
+				alltypesinfo.uncompressed_size_rounded = 0;
+				alltypesinfo.compressed_size = 0;
+				alltypesinfo.compressed_size_rounded = 0;
+				alltypesinfo.compattr_size = 0;
+				alltypesinfo.total_size = 0;
+				alltypesinfo.num_compressed = 0;
+				alltypesinfo.num_files = 0;
+				alltypesinfo.num_hard_link_files = 0;
+				for (i = 0; i < folderinfo.numfiletypes; i++)
+				{
+					alltypesinfo.uncompressed_size += folderinfo.filetypes[i].uncompressed_size;
+					alltypesinfo.uncompressed_size_rounded += folderinfo.filetypes[i].uncompressed_size_rounded;
+					alltypesinfo.compressed_size += folderinfo.filetypes[i].compressed_size;
+					alltypesinfo.compressed_size_rounded += folderinfo.filetypes[i].compressed_size_rounded;
+					alltypesinfo.compattr_size += folderinfo.filetypes[i].compattr_size;
+					alltypesinfo.total_size += folderinfo.filetypes[i].total_size;
+					alltypesinfo.num_compressed += folderinfo.filetypes[i].num_compressed;
+					alltypesinfo.num_files += folderinfo.filetypes[i].num_files;
+					alltypesinfo.num_hard_link_files += folderinfo.filetypes[i].num_hard_link_files;
+					
+					if (!folderinfo.invert_filetypelist)
+						printf("\nFile content type: %s\n", folderinfo.filetypes[i].filetype);
+					if (folderinfo.filetypes[i].numextensions > 0)
+					{
+						if (!folderinfo.invert_filetypelist)
+							printf ("File extension(s): %s", folderinfo.filetypes[i].extensions[0]);
+						free(folderinfo.filetypes[i].extensions[0]);
+						for (j = 1; j < folderinfo.filetypes[i].numextensions; j++)
+						{
+							if (!folderinfo.invert_filetypelist)
+								printf (", %s", folderinfo.filetypes[i].extensions[j]);
+							free(folderinfo.filetypes[i].extensions[j]);
+						}
+						free(folderinfo.filetypes[i].extensions);
+						if (!folderinfo.invert_filetypelist)
+							printf("\n");
+					}
+					if (!folderinfo.invert_filetypelist)
+						printf("Number of HFS+ compressed files: %lld\n", folderinfo.filetypes[i].num_compressed);
+					if (printVerbose > 0 && (!folderinfo.invert_filetypelist))
+					{
+						printf("Total number of files: %lld\n", folderinfo.filetypes[i].num_files);
+						if (hardLinkCheck)
+							printf("Total number of file hard links: %lld\n", folderinfo.filetypes[i].num_hard_link_files);
+						filesize = folderinfo.filetypes[i].uncompressed_size;
+						filesize_rounded = folderinfo.filetypes[i].uncompressed_size_rounded;
+						if (folderinfo.filetypes[i].num_hard_link_files == 0 || !hardLinkCheck)
+							printf("File(s) size (uncompressed; reported size by Mac OS 10.6+ Finder): %s\n", getSizeStr(filesize, filesize_rounded));
+						else
+							printf("File(s) size (uncompressed): %s\n", getSizeStr(filesize, filesize_rounded));
+						filesize = folderinfo.filetypes[i].compressed_size;
+						filesize_rounded = folderinfo.filetypes[i].compressed_size_rounded;
+						if (folderinfo.filetypes[i].num_hard_link_files == 0 || !hardLinkCheck)
+							printf("File(s) size (compressed - decmpfs xattr; reported size by Mac OS 10.0-10.5 Finder): %s\n", getSizeStr(filesize, filesize_rounded));
+						else
+							printf("File(s) size (compressed - decmpfs xattr): %s\n", getSizeStr(filesize, filesize_rounded));
+						filesize = folderinfo.filetypes[i].compressed_size + folderinfo.filetypes[i].compattr_size;
+						filesize_rounded = folderinfo.filetypes[i].compressed_size_rounded + folderinfo.filetypes[i].compattr_size;
+						printf("File(s) size (compressed): %s\n", getSizeStr(filesize, filesize_rounded));
+						printf("Compression savings: %0.1f%%\n", (1.0 - ((float) (folderinfo.filetypes[i].compressed_size + folderinfo.filetypes[i].compattr_size) / folderinfo.filetypes[i].uncompressed_size)) * 100.0);
+						filesize = folderinfo.filetypes[i].total_size;
+						printf("Approximate total file(s) size (files + file overhead): %s\n", getSizeStr(filesize, filesize));
+					}
+					free(folderinfo.filetypes[i].filetype);
+				}
+				if (folderinfo.invert_filetypelist)
+				{
+					alltypesinfo.uncompressed_size = folderinfo.uncompressed_size - alltypesinfo.uncompressed_size;
+					alltypesinfo.uncompressed_size_rounded = folderinfo.uncompressed_size_rounded - alltypesinfo.uncompressed_size_rounded;
+					alltypesinfo.compressed_size = folderinfo.compressed_size - alltypesinfo.compressed_size;
+					alltypesinfo.compressed_size_rounded = folderinfo.compressed_size_rounded - alltypesinfo.compressed_size_rounded;
+					alltypesinfo.compattr_size = folderinfo.compattr_size - alltypesinfo.compattr_size;
+					alltypesinfo.total_size = folderinfo.total_size - alltypesinfo.total_size;
+					alltypesinfo.num_compressed = folderinfo.num_compressed - alltypesinfo.num_compressed;
+					alltypesinfo.num_files = folderinfo.num_files - alltypesinfo.num_files;
+					alltypesinfo.num_hard_link_files = folderinfo.num_hard_link_files - alltypesinfo.num_hard_link_files;
+				}
+				if (folderinfo.numfiletypes > 1 || folderinfo.invert_filetypelist)
+				{
+					printf("\nTotals of file content types\n");
+					printf("Number of HFS+ compressed files: %lld\n", alltypesinfo.num_compressed);
+					if (printVerbose > 0)
+					{
+						printf("Total number of files: %lld\n", alltypesinfo.num_files);
+						if (hardLinkCheck)
+							printf("Total number of file hard links: %lld\n", alltypesinfo.num_hard_link_files);
+						filesize = alltypesinfo.uncompressed_size;
+						filesize_rounded = alltypesinfo.uncompressed_size_rounded;
+						if (alltypesinfo.num_hard_link_files == 0 || !hardLinkCheck)
+							printf("File(s) size (uncompressed; reported size by Mac OS 10.6+ Finder): %s\n", getSizeStr(filesize, filesize_rounded));
+						else
+							printf("File(s) size (uncompressed): %s\n", getSizeStr(filesize, filesize_rounded));
+						filesize = alltypesinfo.compressed_size;
+						filesize_rounded = alltypesinfo.compressed_size_rounded;
+						if (alltypesinfo.num_hard_link_files == 0 || !hardLinkCheck)
+							printf("File(s) size (compressed - decmpfs xattr; reported size by Mac OS 10.0-10.5 Finder): %s\n", getSizeStr(filesize, filesize_rounded));
+						else
+							printf("File(s) size (compressed - decmpfs xattr): %s\n", getSizeStr(filesize, filesize_rounded));
+						filesize = alltypesinfo.compressed_size + alltypesinfo.compattr_size;
+						filesize_rounded = alltypesinfo.compressed_size_rounded + alltypesinfo.compattr_size;
+						printf("File(s) size (compressed): %s\n", getSizeStr(filesize, filesize_rounded));
+						printf("Compression savings: %0.1f%%\n", (1.0 - ((float) (alltypesinfo.compressed_size + alltypesinfo.compattr_size) / alltypesinfo.uncompressed_size)) * 100.0);
+						filesize = alltypesinfo.total_size;
+						printf("Approximate total file(s) size (files + file overhead): %s\n", getSizeStr(filesize, filesize));
+					}
+				}
+				printf("\n");
+			}
 			if (folderinfo.num_compressed == 0 && !applycomp)
 				printf("Folder contains no compressed files\n");
 			else if (folderinfo.num_compressed == 0 && applycomp)
@@ -1761,7 +2413,7 @@ int main (int argc, const char * argv[])
 				printf("Folder size (compressed): %s\n", getSizeStr(foldersize, foldersize_rounded));
 				printf("Compression savings: %0.1f%%\n", (1.0 - ((float) (folderinfo.compressed_size + folderinfo.compattr_size) / folderinfo.uncompressed_size)) * 100.0);
 				foldersize = folderinfo.total_size;
-				printf("Appoximate total folder size (files + file overhead + folder overhead): %s\n", getSizeStr(foldersize, foldersize));
+				printf("Approximate total folder size (files + file overhead + folder overhead): %s\n", getSizeStr(foldersize, foldersize));
 			}
 		}
 	}
@@ -1770,6 +2422,8 @@ int main (int argc, const char * argv[])
 		free(fullpath);
 	if (free_dst)
 		free(fullpathdst);
+	if (folderinfo.filetypeslist != NULL)
+		free(folderinfo.filetypeslist);
 	
 	return 0;
 }
